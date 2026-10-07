@@ -349,6 +349,7 @@ class RaftNode:
         self.voted_for = self.id
         self.votes_received = {self.id}
         self.leader_id = None
+        self.persist()
         self._reset_election_timer()
         self._broadcast(
             RequestVote(self.current_term, self.id, self.last_log_index(), self.last_log_term())
@@ -358,10 +359,14 @@ class RaftNode:
     def handle_request_vote(self, msg):
         if msg.term < self.current_term:
             return RequestVoteReply(self.current_term, self.id, False)
+        if msg.term > self.current_term:
+            self._become_follower(msg.term)
         if self.voted_for is not None and self.voted_for != msg.candidate:
             return RequestVoteReply(self.current_term, self.id, False)
         if not self._candidate_log_is_up_to_date(msg.last_log_index, msg.last_log_term):
             return RequestVoteReply(self.current_term, self.id, False)
+        self.state = self.FOLLOWER
+        self.leader_id = None
         self.voted_for = msg.candidate
         self._reset_election_timer()
         self.persist()
@@ -430,7 +435,6 @@ class RaftNode:
 
     def handle_append_entries(self, msg):
         if msg.term < self.current_term:
-            self._reset_election_timer()
             return AppendEntriesReply(self.current_term, self.id, False, self.last_log_index())
         if msg.term > self.current_term:
             self.current_term = msg.term
@@ -440,6 +444,8 @@ class RaftNode:
         self.leader_id = msg.leader
         self._reset_election_timer()
         if msg.prev_log_index > self.last_log_index():
+            return AppendEntriesReply(self.current_term, self.id, False, self.last_log_index())
+        if self.entry_term(msg.prev_log_index) != msg.prev_log_term:
             return AppendEntriesReply(self.current_term, self.id, False, self.last_log_index())
         self._merge_entries(msg.prev_log_index, msg.entries)
         self._advance_follower_commit(msg.leader_commit)
@@ -459,7 +465,7 @@ class RaftNode:
 
     def _truncate_from(self, index):
         """Edit the stored log at ``index``."""
-        del self.log[index - 1 : index]
+        del self.log[index - 1 :]
 
     def _advance_follower_commit(self, leader_commit):
         target = min(leader_commit, self.last_log_index())
@@ -472,20 +478,23 @@ class RaftNode:
     def _majority_match_index(self):
         """The match index the leader uses when it advances the commit index."""
         matches = sorted(self.match_index.values(), reverse=True)
-        return matches[len(matches) // 2 + 1]
+        return matches[len(matches) // 2]
 
     def _advance_commit(self):
         if self.state != self.LEADER:
             return
         index = self._majority_match_index()
-        if index > self.commit_index:
+        if index > self.commit_index and self.entry_term(index) == self.current_term:
             self.commit_index = index
             self.persist()
 
     def handle_append_entries_reply(self, msg):
+        if msg.term > self.current_term:
+            self._become_follower(msg.term)
+            return
         if self.state != self.LEADER:
             return
-        if msg.term != self.current_term:
+        if msg.term < self.current_term:
             return
         if msg.success:
             matched = min(msg.matched_index, self.last_log_index())
